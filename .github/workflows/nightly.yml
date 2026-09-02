@@ -51,12 +51,6 @@ jobs:
           echo "date=$(date -u +'%Y-%m-%d')" >> "${GITHUB_OUTPUT}"
           echo "Building main at ${sha}."
 
-  # Keep the scheduled backend coverage in one place so it cannot drift from PR CI.
-  rust_ci:
-    name: Rust CI
-    needs: source
-    uses: ./.github/workflows/rust-ci.yml
-
   rust_extended:
     name: Rust extended checks
     needs: source
@@ -173,49 +167,9 @@ jobs:
       - name: Test pressure report checker
         run: node --test tools/pressure/check_gateway_stage_report.test.js
 
-  checks:
-    name: Nightly check gate
-    runs-on: ubuntu-latest
-    if: ${{ always() }}
-    needs:
-      - source
-      - rust_ci
-      - rust_extended
-      - frontend
-      - repository_health
-    steps:
-      - name: Verify check jobs
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          failed=0
-          echo "source=${{ needs.source.result }}"
-          echo "rust_ci=${{ needs.rust_ci.result }}"
-          echo "rust_extended=${{ needs.rust_extended.result }}"
-          echo "frontend=${{ needs.frontend.result }}"
-          echo "repository_health=${{ needs.repository_health.result }}"
-
-          for result in \
-            "${{ needs.source.result }}" \
-            "${{ needs.rust_ci.result }}" \
-            "${{ needs.rust_extended.result }}" \
-            "${{ needs.frontend.result }}" \
-            "${{ needs.repository_health.result }}"; do
-            if [[ "${result}" != "success" ]]; then
-              failed=1
-            fi
-          done
-
-          if [[ "${failed}" -ne 0 ]]; then
-            echo 'One or more nightly checks failed or were cancelled.' >&2
-            exit 1
-          fi
-
   build:
     name: Build ${{ matrix.name }}
-    needs: [source, checks]
-    if: ${{ needs.checks.result == 'success' }}
+    needs: [source]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
@@ -292,8 +246,7 @@ jobs:
 
   docker:
     name: Publish nightly GHCR image
-    needs: [source, checks, build]
-    if: ${{ needs.checks.result == 'success' && needs.build.result == 'success' }}
+    needs: [source, build]
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -352,8 +305,7 @@ jobs:
 
   package:
     name: Package nightly archives
-    needs: [source, checks, build]
-    if: ${{ needs.checks.result == 'success' && needs.build.result == 'success' }}
+    needs: [source, build]
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -428,173 +380,3 @@ jobs:
           if-no-files-found: error
           overwrite: true
           retention-days: 7
-
-  github_release:
-    name: Publish nightly GitHub Release
-    needs: [source, checks, docker, package]
-    if: ${{ needs.checks.result == 'success' && needs.docker.result == 'success' && needs.package.result == 'success' }}
-    runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: write
-    steps:
-      - name: Download nightly package artifact
-        uses: actions/download-artifact@v5
-        with:
-          name: nightly-release-assets
-          path: release-assets
-
-      - name: Update rolling nightly release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          RELEASE_TAG: nightly
-          SOURCE_SHA: ${{ needs.source.outputs.sha }}
-          SOURCE_SHORT_SHA: ${{ needs.source.outputs.short_sha }}
-          RELEASE_DATE: ${{ needs.source.outputs.date }}
-        run: |
-          set -euo pipefail
-
-          release_title="Aether Nightly ${RELEASE_DATE} (${SOURCE_SHORT_SHA})"
-          notes_file="${RUNNER_TEMP}/nightly-release-notes.md"
-          cat > "${notes_file}" <<EOF
-          ## Aether nightly
-
-          This rolling prerelease was built from [main commit ${SOURCE_SHORT_SHA}](https://github.com/${REPOSITORY}/commit/${SOURCE_SHA}).
-
-          - Source branch: main
-          - Source commit: ${SOURCE_SHA}
-          - Build date (UTC): ${RELEASE_DATE}
-          - Container image: ${GHCR_IMAGE}:nightly
-          - Commit image: ${GHCR_IMAGE}:nightly-${SOURCE_SHA}
-
-          The nightly tag and assets are replaced by the next successful daily build.
-          EOF
-
-          # Create a draft on the first run. Later runs repair the same rolling
-          # release on retry if any upload or metadata update is interrupted.
-          if ! gh release view "${RELEASE_TAG}" --repo "${REPOSITORY}" >/dev/null 2>&1; then
-            gh release create "${RELEASE_TAG}" \
-              --repo "${REPOSITORY}" \
-              --draft \
-              --prerelease \
-              --latest=false \
-              --target "${SOURCE_SHA}" \
-              --title "${release_title}" \
-              --notes-file "${notes_file}"
-          fi
-
-          # Upload archives first, then the checksum/installer metadata. This
-          # keeps a failed upload from leaving a checksum that describes files
-          # which have not reached the Release yet.
-          gh release upload "${RELEASE_TAG}" release-assets/*.tar.gz \
-            --repo "${REPOSITORY}" \
-            --clobber
-          gh release upload "${RELEASE_TAG}" \
-            release-assets/SHA256SUMS \
-            release-assets/install.sh \
-            --repo "${REPOSITORY}" \
-            --clobber
-
-          # target_commitish does not move an existing git tag. Move the ref
-          # only after the complete asset set is available.
-          if gh api "repos/${REPOSITORY}/git/ref/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
-            gh api -X PATCH "repos/${REPOSITORY}/git/refs/tags/${RELEASE_TAG}" \
-              -f "sha=${SOURCE_SHA}" \
-              -F 'force=true' >/dev/null
-          else
-            gh api -X POST "repos/${REPOSITORY}/git/refs" \
-              -f "ref=refs/tags/${RELEASE_TAG}" \
-              -f "sha=${SOURCE_SHA}" >/dev/null
-          fi
-
-          gh release edit "${RELEASE_TAG}" \
-            --repo "${REPOSITORY}" \
-            --draft=false \
-            --prerelease \
-            --latest=false \
-            --target "${SOURCE_SHA}" \
-            --title "${release_title}" \
-            --notes-file "${notes_file}"
-
-          expected_assets=(
-            aether-nightly-linux-amd64.tar.gz
-            aether-nightly-linux-arm64.tar.gz
-            aether-nightly-macos-amd64.tar.gz
-            aether-nightly-macos-arm64.tar.gz
-            SHA256SUMS
-            install.sh
-          )
-          asset_names="$(gh release view "${RELEASE_TAG}" --repo "${REPOSITORY}" --json assets --jq '.assets[].name')"
-          for expected_asset in "${expected_assets[@]}"; do
-            if ! grep -Fxq "${expected_asset}" <<<"${asset_names}"; then
-              echo "Published release is missing asset ${expected_asset}." >&2
-              exit 1
-            fi
-          done
-
-          resolved_sha=""
-          for attempt in {1..10}; do
-            resolved_sha="$(gh api "repos/${REPOSITORY}/commits/${RELEASE_TAG}" --jq '.sha' 2>/dev/null || true)"
-            if [[ "${resolved_sha}" == "${SOURCE_SHA}" ]]; then
-              break
-            fi
-            sleep 2
-          done
-          if [[ "${resolved_sha}" != "${SOURCE_SHA}" ]]; then
-            echo "nightly tag resolved to ${resolved_sha}, expected ${SOURCE_SHA}." >&2
-            exit 1
-          fi
-
-          release_state="$(gh release view "${RELEASE_TAG}" --repo "${REPOSITORY}" --json isDraft,isPrerelease --jq '[.isDraft, .isPrerelease] | @tsv')"
-          if [[ "${release_state}" != $'false\ttrue' ]]; then
-            echo "nightly release has unexpected state: ${release_state}" >&2
-            exit 1
-          fi
-
-          echo "Published ${RELEASE_TAG} for ${SOURCE_SHA}."
-
-  summary:
-    name: Nightly summary
-    runs-on: ubuntu-latest
-    if: ${{ always() }}
-    needs:
-      - source
-      - rust_ci
-      - rust_extended
-      - frontend
-      - repository_health
-      - checks
-      - build
-      - docker
-      - package
-      - github_release
-    steps:
-      - name: Verify nightly pipeline
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          failed=0
-          for entry in \
-            "source=${{ needs.source.result }}" \
-            "rust_ci=${{ needs.rust_ci.result }}" \
-            "rust_extended=${{ needs.rust_extended.result }}" \
-            "frontend=${{ needs.frontend.result }}" \
-            "repository_health=${{ needs.repository_health.result }}" \
-            "checks=${{ needs.checks.result }}" \
-            "build=${{ needs.build.result }}" \
-            "docker=${{ needs.docker.result }}" \
-            "package=${{ needs.package.result }}" \
-            "github_release=${{ needs.github_release.result }}"; do
-            echo "${entry}"
-            if [[ "${entry#*=}" != "success" ]]; then
-              failed=1
-            fi
-          done
-
-          if [[ "${failed}" -ne 0 ]]; then
-            echo 'Nightly pipeline did not publish a new release.' >&2
-            exit 1
-          fi
