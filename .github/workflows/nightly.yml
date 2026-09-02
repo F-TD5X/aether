@@ -1,9 +1,6 @@
 name: Nightly Release
 
 on:
-  # 02:17 Asia/Shanghai (18:17 UTC) every day.
-  schedule:
-    - cron: '17 18 * * *'
   workflow_dispatch:
 
 # Checks and builds only need read access. Publishing jobs opt into write access
@@ -25,7 +22,7 @@ env:
   CARGO_PROFILE_TEST_DEBUG: '0'
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: '1'
-  GHCR_IMAGE: ghcr.io/fawney19/aether
+  GHCR_IMAGE: ghcr.io/f-td5x/aether
 
 jobs:
   source:
