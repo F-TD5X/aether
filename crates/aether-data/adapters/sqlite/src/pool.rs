@@ -38,7 +38,11 @@ impl SqlitePoolFactory {
                 let options = options
                     .create_if_missing(true)
                     .foreign_keys(true)
-                    .statement_cache_capacity(self.config.pool.statement_cache_capacity);
+                    .statement_cache_capacity(self.config.pool.statement_cache_capacity)
+                    // Negative cache_size is KiB. 2 MiB is enough for single-node SQLite
+                    // without paying SQLite's default 8 MiB page cache per connection.
+                    .pragma("cache_size", "-2048")
+                    .pragma("mmap_size", "0");
                 if is_memory {
                     options
                 } else {

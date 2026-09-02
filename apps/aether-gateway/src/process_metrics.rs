@@ -3,7 +3,10 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aether_runtime::{MetricKind, MetricSample};
-use sysinfo::{get_current_pid, Networks, Pid, ProcessesToUpdate, System};
+use sysinfo::{
+    get_current_pid, CpuRefreshKind, MemoryRefreshKind, Networks, Pid, ProcessesToUpdate,
+    RefreshKind, System,
+};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct GatewayProcessResourceSnapshot {
@@ -316,14 +319,17 @@ pub(crate) struct GatewayProcessResourceMonitor {
 
 impl GatewayProcessResourceMonitor {
     pub(crate) fn new() -> Self {
-        let mut system = System::new_all();
+        let mut system = System::new();
         let mut networks = Networks::new_with_refreshed_list();
         let current_pid = get_current_pid().ok();
+        system.refresh_specifics(
+            RefreshKind::new()
+                .with_memory(MemoryRefreshKind::everything())
+                .with_cpu(CpuRefreshKind::everything()),
+        );
         if let Some(pid) = current_pid {
             system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
         }
-        system.refresh_cpu_usage();
-        system.refresh_memory();
         networks.refresh();
         Self {
             system: Mutex::new(system),

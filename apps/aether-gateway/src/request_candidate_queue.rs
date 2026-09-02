@@ -24,7 +24,7 @@ const DB_WRITE_CONCURRENCY_LIMIT_ENV: &str =
 const DB_BATCH_SIZE_ENV: &str = "AETHER_GATEWAY_REQUEST_CANDIDATE_DB_BATCH_SIZE";
 const RUNTIME_THREADS_ENV: &str = "AETHER_GATEWAY_REQUEST_CANDIDATE_QUEUE_RUNTIME_THREADS";
 
-const DEFAULT_QUEUE_CAPACITY: usize = 65_536;
+const DEFAULT_QUEUE_CAPACITY: usize = 2_048;
 const DEFAULT_BATCH_SIZE: usize = 512;
 const DEFAULT_DB_BATCH_SIZE: usize = 512;
 const MAX_DB_BATCH_SIZE: usize = 1_000;
@@ -34,7 +34,7 @@ const MAX_CONSECUTIVE_ACTIVE_FLUSHES: usize = 2;
 // Keep normal candidate writes from being indefinitely delayed by a continuous
 // lifecycle stream. Priority batches still flush immediately.
 const MAX_CONSECUTIVE_PRIORITY_FLUSHES: usize = 4;
-const DEFAULT_WORKERS: usize = 2;
+const DEFAULT_WORKERS: usize = 1;
 const DEFAULT_RUNTIME_THREADS: usize = 1;
 const MAX_RUNTIME_THREADS: usize = 8;
 const RUNTIME_THREAD_STACK_BYTES: usize = 2 * 1024 * 1024;
@@ -927,6 +927,7 @@ fn request_candidate_background_runtime() -> &'static tokio::runtime::Runtime {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(request_candidate_background_runtime_threads())
+            .max_blocking_threads(4)
             .thread_name(RUNTIME_THREAD_NAME)
             .thread_stack_size(RUNTIME_THREAD_STACK_BYTES)
             .build()

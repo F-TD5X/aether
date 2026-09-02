@@ -14,7 +14,7 @@ use tokio::sync::Notify;
 
 use crate::data::auth::GatewayAuthApiKeySnapshot;
 
-const AUTH_RUNTIME_CACHE_MAX_ENTRIES: usize = 16_384;
+const AUTH_RUNTIME_CACHE_MAX_ENTRIES: usize = 2_048;
 
 #[derive(Debug)]
 struct CacheSingleflight<K> {

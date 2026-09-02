@@ -2,6 +2,14 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// Keep jemalloc from creating one arena per CPU and holding dirty pages. The
+// prefixed symbol is what tikv-jemallocator looks up at init.
+#[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
+#[used]
+#[no_mangle]
+pub static _rjem_malloc_conf: *const std::ffi::c_char =
+    c"narenas:2,dirty_decay_ms:500,muzzy_decay_ms:500".as_ptr();
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -249,11 +257,22 @@ impl From<GatewayLogRotationArg> for LogRotation {
     }
 }
 
-const GATEWAY_TOKIO_WORKER_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+const GATEWAY_TOKIO_WORKER_STACK_SIZE_BYTES: usize = 2 * 1024 * 1024;
+const MIN_GATEWAY_TOKIO_WORKER_STACK_SIZE_BYTES: usize = 512 * 1024;
+const MAX_GATEWAY_TOKIO_WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
+const GATEWAY_TOKIO_WORKER_THREADS_ENV: &str = "AETHER_GATEWAY_TOKIO_WORKER_THREADS";
+const GATEWAY_TOKIO_MAX_BLOCKING_THREADS_ENV: &str = "AETHER_GATEWAY_TOKIO_MAX_BLOCKING_THREADS";
+const GATEWAY_TOKIO_THREAD_STACK_SIZE_ENV: &str = "AETHER_GATEWAY_TOKIO_THREAD_STACK_BYTES";
+const DEFAULT_SINGLE_NODE_TOKIO_WORKER_THREADS: usize = 2;
+const DEFAULT_SINGLE_NODE_TOKIO_MAX_BLOCKING_THREADS: usize = 8;
+const DEFAULT_MULTI_NODE_TOKIO_MAX_BLOCKING_THREADS: usize = 64;
+const MAX_GATEWAY_TOKIO_WORKER_THREADS: usize = 64;
+const MAX_GATEWAY_TOKIO_BLOCKING_THREADS: usize = 512;
 const DEFAULT_SQL_POOL_ACQUIRE_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_SQL_POOL_IDLE_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_SQL_POOL_MAX_LIFETIME_MS: u64 = 30 * 60_000;
 const DEFAULT_SQL_POOL_STATEMENT_CACHE_CAPACITY: usize = 100;
+const DEFAULT_SQLITE_POOL_STATEMENT_CACHE_CAPACITY: usize = 32;
 const DEFAULT_SQLITE_POOL_MAX_CONNECTIONS: u32 = 1;
 // Per-process default for server SQL backends. Keep this below common
 // database server max_connections defaults; operators can override with
@@ -531,7 +550,12 @@ fn automatic_sql_pool_config_for_parallelism(
         acquire_timeout_ms: DEFAULT_SQL_POOL_ACQUIRE_TIMEOUT_MS,
         idle_timeout_ms: DEFAULT_SQL_POOL_IDLE_TIMEOUT_MS,
         max_lifetime_ms: DEFAULT_SQL_POOL_MAX_LIFETIME_MS,
-        statement_cache_capacity: DEFAULT_SQL_POOL_STATEMENT_CACHE_CAPACITY,
+        statement_cache_capacity: match driver {
+            DatabaseDriver::Sqlite => DEFAULT_SQLITE_POOL_STATEMENT_CACHE_CAPACITY,
+            DatabaseDriver::Mysql | DatabaseDriver::Postgres => {
+                DEFAULT_SQL_POOL_STATEMENT_CACHE_CAPACITY
+            }
+        },
         require_ssl: false,
     }
 }
@@ -1546,6 +1570,91 @@ fn gateway_listener_shards(shards: usize) -> usize {
     shards.clamp(1, MAX_GATEWAY_LISTENER_SHARDS)
 }
 
+fn gateway_listener_shards_for_topology(shards: usize, topology: DeploymentTopologyArg) -> usize {
+    if shards == 0 && matches!(topology, DeploymentTopologyArg::SingleNode) {
+        return 1;
+    }
+    gateway_listener_shards(shards)
+}
+
+fn env_deployment_is_single_node() -> bool {
+    match env_var_trimmed("AETHER_GATEWAY_DEPLOYMENT_TOPOLOGY") {
+        Some(value) if value.eq_ignore_ascii_case("multi-node") => false,
+        _ => true,
+    }
+}
+
+fn parse_gateway_tokio_thread_stack_size(configured: Option<&str>) -> usize {
+    configured
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(GATEWAY_TOKIO_WORKER_STACK_SIZE_BYTES)
+        .clamp(
+            MIN_GATEWAY_TOKIO_WORKER_STACK_SIZE_BYTES,
+            MAX_GATEWAY_TOKIO_WORKER_STACK_SIZE_BYTES,
+        )
+}
+
+fn parse_gateway_tokio_worker_threads(
+    configured: Option<&str>,
+    topology_is_single_node: bool,
+    parallelism: usize,
+) -> Option<usize> {
+    if let Some(threads) = configured
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+    {
+        return Some(threads.clamp(1, MAX_GATEWAY_TOKIO_WORKER_THREADS));
+    }
+    if topology_is_single_node {
+        Some(
+            parallelism
+                .min(DEFAULT_SINGLE_NODE_TOKIO_WORKER_THREADS)
+                .max(1),
+        )
+    } else {
+        None
+    }
+}
+
+fn parse_gateway_tokio_max_blocking_threads(
+    configured: Option<&str>,
+    topology_is_single_node: bool,
+) -> usize {
+    if let Some(threads) = configured
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+    {
+        return threads.clamp(1, MAX_GATEWAY_TOKIO_BLOCKING_THREADS);
+    }
+    if topology_is_single_node {
+        DEFAULT_SINGLE_NODE_TOKIO_MAX_BLOCKING_THREADS
+    } else {
+        DEFAULT_MULTI_NODE_TOKIO_MAX_BLOCKING_THREADS
+    }
+}
+
+fn gateway_tokio_thread_stack_size() -> usize {
+    parse_gateway_tokio_thread_stack_size(
+        env_var_trimmed(GATEWAY_TOKIO_THREAD_STACK_SIZE_ENV).as_deref(),
+    )
+}
+
+fn gateway_tokio_worker_threads() -> Option<usize> {
+    parse_gateway_tokio_worker_threads(
+        env_var_trimmed(GATEWAY_TOKIO_WORKER_THREADS_ENV).as_deref(),
+        env_deployment_is_single_node(),
+        available_parallelism_usize(),
+    )
+}
+
+fn gateway_tokio_max_blocking_threads() -> usize {
+    parse_gateway_tokio_max_blocking_threads(
+        env_var_trimmed(GATEWAY_TOKIO_MAX_BLOCKING_THREADS_ENV).as_deref(),
+        env_deployment_is_single_node(),
+    )
+}
+
 fn gateway_http2_max_concurrent_streams(streams: u32) -> u32 {
     streams.clamp(
         MIN_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS,
@@ -1775,11 +1884,15 @@ fn validate_deployment_topology(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tokio::runtime::Builder::new_multi_thread()
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder
         .enable_all()
-        .thread_stack_size(GATEWAY_TOKIO_WORKER_STACK_SIZE_BYTES)
-        .build()?
-        .block_on(run())
+        .thread_stack_size(gateway_tokio_thread_stack_size())
+        .max_blocking_threads(gateway_tokio_max_blocking_threads());
+    if let Some(worker_threads) = gateway_tokio_worker_threads() {
+        builder.worker_threads(worker_threads);
+    }
+    builder.build()?.block_on(run())
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -2155,7 +2268,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let listen_backlog = gateway_listen_backlog(args.listen_backlog);
-    let listener_shards = gateway_listener_shards(args.listener_shards);
+    let listener_shards =
+        gateway_listener_shards_for_topology(args.listener_shards, args.deployment_topology);
     let listeners = gateway_listeners(bind_addr, listen_backlog, listener_shards)?;
     let public_base_url = resolve_local_http_base_url(app_port)?;
     let frontdoor_health_url = format!("{public_base_url}/_gateway/health");
@@ -2546,15 +2660,19 @@ mod tests {
         automatic_gateway_request_concurrency_for_parallelism, automatic_sql_pool_config,
         automatic_sql_pool_config_for_parallelism, automatic_usage_queue_workers_for_parallelism,
         ensure_database_backfills_are_current, ensure_database_schema_is_current,
+        gateway_listener_shards_for_topology, parse_gateway_tokio_max_blocking_threads,
+        parse_gateway_tokio_thread_stack_size, parse_gateway_tokio_worker_threads,
         pending_backfills_error, pending_schema_error, resolve_healthcheck_url,
         usage_database_config_for_role, Args, DatabaseDriverArg, DeploymentTopologyArg,
         GatewayDataArgs, GatewayFrontdoorArgs, GatewayLogDestinationArg, GatewayLogFormatArg,
         GatewayLogRotationArg, GatewayLoggingArgs, GatewayRateLimitArgs, GatewayUsageArgs,
         NodeRoleArg, RuntimeBackendArg, VideoTaskTruthSourceArg,
         DEFAULT_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS, DEFAULT_GATEWAY_LISTENER_SHARDS,
-        DEFAULT_GATEWAY_LISTEN_BACKLOG, MAX_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS,
-        MAX_GATEWAY_LISTENER_SHARDS, MAX_GATEWAY_LISTEN_BACKLOG,
-        MIN_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS, MIN_GATEWAY_LISTEN_BACKLOG,
+        DEFAULT_GATEWAY_LISTEN_BACKLOG, DEFAULT_SINGLE_NODE_TOKIO_MAX_BLOCKING_THREADS,
+        DEFAULT_SINGLE_NODE_TOKIO_WORKER_THREADS, GATEWAY_TOKIO_WORKER_STACK_SIZE_BYTES,
+        MAX_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS, MAX_GATEWAY_LISTENER_SHARDS,
+        MAX_GATEWAY_LISTEN_BACKLOG, MIN_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS,
+        MIN_GATEWAY_LISTEN_BACKLOG,
     };
     use aether_data::{DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig};
     use aether_gateway::AppState;
@@ -2716,6 +2834,53 @@ mod tests {
         assert_eq!(
             super::gateway_listener_shards(MAX_GATEWAY_LISTENER_SHARDS + 1),
             MAX_GATEWAY_LISTENER_SHARDS
+        );
+    }
+
+    #[test]
+    fn single_node_auto_listener_shards_stay_at_one() {
+        assert_eq!(
+            gateway_listener_shards_for_topology(0, DeploymentTopologyArg::SingleNode),
+            1
+        );
+        assert_eq!(
+            gateway_listener_shards_for_topology(4, DeploymentTopologyArg::SingleNode),
+            4
+        );
+    }
+
+    #[test]
+    fn multi_node_auto_listener_shards_follow_cpu_default() {
+        let auto_shards = super::gateway_listener_shards(0);
+        assert_eq!(
+            gateway_listener_shards_for_topology(0, DeploymentTopologyArg::MultiNode),
+            auto_shards
+        );
+    }
+
+    #[test]
+    fn single_node_tokio_runtime_defaults_stay_small() {
+        assert_eq!(
+            parse_gateway_tokio_worker_threads(None, true, 8),
+            Some(DEFAULT_SINGLE_NODE_TOKIO_WORKER_THREADS)
+        );
+        assert_eq!(parse_gateway_tokio_worker_threads(None, true, 1), Some(1));
+        assert_eq!(
+            parse_gateway_tokio_max_blocking_threads(None, true),
+            DEFAULT_SINGLE_NODE_TOKIO_MAX_BLOCKING_THREADS
+        );
+        assert_eq!(
+            parse_gateway_tokio_thread_stack_size(None),
+            GATEWAY_TOKIO_WORKER_STACK_SIZE_BYTES
+        );
+        assert_eq!(parse_gateway_tokio_worker_threads(None, false, 8), None);
+        assert_eq!(
+            parse_gateway_tokio_worker_threads(Some("6"), true, 8),
+            Some(6)
+        );
+        assert_eq!(
+            parse_gateway_tokio_max_blocking_threads(Some("12"), false),
+            12
         );
     }
 

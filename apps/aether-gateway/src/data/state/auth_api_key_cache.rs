@@ -12,7 +12,7 @@ use tokio::sync::Notify;
 
 // Security revalidation bypasses this throughput-oriented read cache.
 const AUTH_API_KEY_SNAPSHOT_CACHE_TTL: Duration = Duration::from_secs(30);
-const AUTH_API_KEY_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 16_384;
+const AUTH_API_KEY_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 2_048;
 
 tokio::task_local! {
     static AUTH_API_KEY_READ_CACHE_BYPASS: ();

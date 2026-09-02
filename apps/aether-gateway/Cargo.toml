@@ -11,8 +11,6 @@ default = []
 jemalloc = [
     "dep:tikv-jemallocator",
     "dep:tikv-jemalloc-sys",
-    "tikv-jemallocator/stats",
-    "tikv-jemalloc-sys/stats",
 ]
 testkit = []
 
